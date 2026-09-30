@@ -63,10 +63,40 @@ def _parse_map(data, i):
             raise ValueError(f"unknown VDF record type {rtype:#x} at {i}")
 
 
-def load_shortcuts(path):
+def _write_map(obj, out):
+    for k, v in obj.items():
+        k = k.encode("utf-8")
+        if isinstance(v, dict):
+            out.append(b"\x00" + k + b"\x00")
+            _write_map(v, out)
+            out.append(b"\x08")
+        elif isinstance(v, str):
+            out.append(b"\x01" + k + b"\x00" + v.encode("utf-8") + b"\x00")
+        elif isinstance(v, int):
+            out.append(b"\x02" + k + b"\x00" + struct.pack("<i", v))
+        else:
+            raise ValueError(f"cannot serialize {type(v).__name__} for key {k!r}")
+
+
+def load_vdf(path):
     with open(path, "rb") as f:
         data = f.read()
     root, _ = _parse_map(data, 0)
+    return root
+
+
+def save_vdf(path, root):
+    parts = []
+    _write_map(root, parts)
+    parts.append(b"\x08")
+    tmp = path + ".part"
+    with open(tmp, "wb") as f:
+        f.write(b"".join(parts))
+    os.replace(tmp, path)
+
+
+def load_shortcuts(path):
+    root = load_vdf(path)
     shortcuts = root.get("shortcuts", {})
     return [shortcuts[k] for k in sorted(shortcuts, key=int)]
 
@@ -94,6 +124,18 @@ def is_heroic(shortcut):
 
 def grid_dir(shortcuts_path):
     return os.path.join(os.path.dirname(shortcuts_path), "grid")
+
+
+def steam_running():
+    pidfile = os.path.expanduser("~/.steam/steam.pid")
+    if os.path.isfile(pidfile):
+        try:
+            with open(pidfile) as f:
+                os.kill(int(f.read().strip()), 0)
+            return True
+        except (ValueError, ProcessLookupError, PermissionError):
+            pass
+    return False
 
 
 # --- SteamGridDB API ----------------------------------------------------------
@@ -166,12 +208,15 @@ def main():
                  "~/.config/heroicimport/api_key")
 
     for sc_path in shortcut_files:
-        shortcuts = [s for s in load_shortcuts(sc_path) if is_heroic(s)]
+        root = load_vdf(sc_path)
+        sc_map = root.get("shortcuts", {})
+        shortcuts = [sc_map[k] for k in sorted(sc_map, key=int) if is_heroic(sc_map[k])]
         if not shortcuts:
             continue
         gdir = grid_dir(sc_path)
         print(f"{sc_path}: {len(shortcuts)} Heroic shortcut(s)")
         os.makedirs(gdir, exist_ok=True)
+        vdf_dirty = False
 
         for sc in shortcuts:
             name = sc.get("AppName", "?")
@@ -181,13 +226,20 @@ def main():
                                for ext in (".png", ".jpg", ".webp"))}
             missing = [t for t in ART_TYPES if t[0] not in existing]
 
+            icon_path = sc.get("icon", "")
+            icon_ok = bool(icon_path) and os.path.isfile(icon_path)
+
             if args.dry_run:
-                status = "complete" if not missing else \
-                         "missing: " + ",".join(suf or "grid" for suf, _, _ in missing)
+                parts = [] if not missing else \
+                        ["missing: " + ",".join(suf or "grid" for suf, _, _ in missing)]
+                if not icon_ok:
+                    parts.append("no icon")
+                status = "; ".join(parts) if parts else "complete"
                 print(f"  {appid:>12}  {name}  [{status}]")
                 continue
 
-            if not missing and not args.force:
+            need_icon = not icon_ok or args.force
+            if not missing and not need_icon:
                 print(f"  {name}: artwork complete, skipping")
                 continue
 
@@ -223,6 +275,45 @@ def main():
                         pass
                     continue
                 print(f"    {endpoint}{suf}: saved {os.path.basename(dest)}")
+
+            if need_icon:
+                # reuse an icon downloaded by a previous run
+                prior = next((os.path.join(gdir, f) for f in os.listdir(gdir)
+                              if f.startswith(f"{appid}_icon.")), None)
+                if prior and not args.force:
+                    sc["icon"] = prior
+                    vdf_dirty = True
+                    print(f"    icon: reusing {os.path.basename(prior)} + shortcuts.vdf entry")
+                    continue
+                try:
+                    url = best_image("icons", game["id"], key, {"types": "static"})
+                except urllib.error.HTTPError as e:
+                    print(f"    icon: API error {e.code}")
+                    url = None
+                if url:
+                    ext = os.path.splitext(urllib.parse.urlparse(url).path)[1] or ".png"
+                    dest = os.path.join(gdir, f"{appid}_icon{ext}")
+                    try:
+                        download(url, dest)
+                        sc["icon"] = dest
+                        vdf_dirty = True
+                        print(f"    icon: saved {os.path.basename(dest)} + shortcuts.vdf entry")
+                    except Exception as e:
+                        print(f"    icon: download failed ({e})")
+                        try:
+                            os.remove(dest + ".part")
+                        except OSError:
+                            pass
+                elif not icon_ok:
+                    print("    icon: none available")
+
+        if vdf_dirty:
+            if steam_running():
+                print("  WARNING: Steam is running; quit Steam and re-run to write "
+                      "icon paths into shortcuts.vdf (icons already downloaded).")
+            else:
+                save_vdf(sc_path, root)
+                print("  shortcuts.vdf updated with icon paths")
 
     if not args.dry_run:
         print("\nRestart Steam to pick up new artwork.")

@@ -55,3 +55,10 @@ Restart Steam afterwards so it picks up the new artwork.
 4. Searches SteamGridDB by game name and downloads the highest-scored
    static image for each missing artwork type. Downloads are atomic
    (temp file + rename) and per-game failures are skipped, not fatal.
+5. Fixes the small square game-list icon: if a shortcut's `icon` path is
+   empty or points to a missing file, the SteamGridDB icon is downloaded
+   as `<appid>_icon.png` and the path is written back into
+   `shortcuts.vdf` (a full binary-VDF rewrite, verified to round-trip
+   byte-identically). Steam must be closed for this step — it rewrites
+   `shortcuts.vdf` on exit — so if Steam is running the icons are still
+   downloaded and you simply re-run the tool after quitting Steam.
